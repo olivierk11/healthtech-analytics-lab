@@ -1,0 +1,6 @@
+# local run output (re-created by the scripts)
+results/
+timings.txt
+*.log
+.DS_Store
+Thumbs.db
