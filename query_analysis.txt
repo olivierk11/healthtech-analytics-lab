@@ -1,0 +1,295 @@
+HEALTHCARE ANALYTICS LAB - PART 2: QUERY ANALYSIS (NORMALIZED OLTP SCHEMA)
+==========================================================================
+
+TEST SETUP
+----------
+The provided sample data (3 patients, 4 encounters) runs every query in well
+under a millisecond, which says nothing about performance. So I used two copies
+of the exact same OLTP schema:
+
+  1. healthtech_oltp      - the lab's sample data, used to CHECK CORRECTNESS
+                            (results verified by hand).
+  2. healthtech_oltp_big  - synthetic data at hospital scale, used to MEASURE:
+         patients              100,000
+         providers               1,000   (20 specialties, 20 departments)
+         encounters          1,000,000   (2022-2024; 65% Outpatient, 20% ER, 15% Inpatient)
+         encounter_diagnoses 2,500,000   (1-4 per encounter, skewed toward common codes)
+         encounter_procedures 2,000,001  (1-3 per encounter)
+         diagnoses / procedures  2,000 / 1,000 codes
+         billing               950,000   (95% of encounters billed)
+     (generator script: sql/03_generate_big_data.sql)
+
+Two measurement runs on the same schema, queries and data volume:
+
+  PRIMARY run (the numbers this report uses):
+    MySQL 8 Server + MySQL Workbench on a Windows laptop, 2 GB InnoDB buffer pool.
+    Each query run 4 times; the 1st run (cache warm-up) is discarded and the
+    MEDIAN of runs 2-4 is reported (Q2: 2 runs, the 2nd is reported).
+    Time = Workbench "Duration" (server execution time, excludes grid fetch).
+
+  REFERENCE run (cross-check, Linux server):
+    MariaDB 10.11, 2 GB buffer pool, median of 3 warm runs. This run also
+    measured "rows read": the sum of the server's Handler_read_* counters for
+    one execution (every index or table row the engine actually read).
+    Rows read depends on the data and plan, not the hardware, so it is
+    reported from this run.
+
+Both runs show the same pattern; the laptop is about 2.5-3x slower overall.
+
+Note on the sample data: as written in the lab, the billing INSERT comes
+BEFORE the encounters INSERT. With InnoDB foreign keys this fails with
+"ERROR 1452: Cannot add or update a child row: a foreign key constraint fails".
+I reordered the inserts so parents load before children (sql/02_sample_data_fixed.sql).
+
+
+QUESTION 1: Monthly Encounters by Specialty
+-------------------------------------------
+
+SQL Query:
+SELECT DATE_FORMAT(e.encounter_date, '%Y-%m') AS encounter_month,
+       s.specialty_name,
+       e.encounter_type,
+       COUNT(*)                     AS total_encounters,
+       COUNT(DISTINCT e.patient_id) AS unique_patients
+FROM encounters e
+JOIN providers   p ON e.provider_id  = p.provider_id
+JOIN specialties s ON p.specialty_id = s.specialty_id
+GROUP BY DATE_FORMAT(e.encounter_date, '%Y-%m'), s.specialty_name, e.encounter_type
+ORDER BY encounter_month, s.specialty_name, e.encounter_type;
+
+Sample-data check: 2024-05 Cardiology Outpatient 1/1, 2024-05 Internal
+Medicine Outpatient 1/1, 2024-06 Cardiology Inpatient 1/1, 2024-06 Emergency
+ER 1/1 - correct.
+
+Schema Analysis:
+- Tables joined: encounters, providers, specialties
+- Number of joins: 2
+  Specialty is not stored on the encounter. To get it you must go
+  encounter -> provider -> specialty.
+
+Performance:
+- Execution time: 11.22 seconds (runs 2-4: 11.77, 11.22, 11.05)
+  (reference run: 4.52 s)
+- Estimated rows scanned: ~2.5 million (measured 2,485,982 row reads)
+
+Bottleneck Identified:
+EXPLAIN shows the plan starts from the 20-row specialties table, joins to
+providers, then fetches every provider's encounters through the provider_id
+secondary index. That means 1,000,000 index lookups, each followed by a
+random jump into the clustered encounters table to read encounter_date,
+encounter_type and patient_id.
+
+The GROUP BY is the second cost. It groups on an EXPRESSION
+(DATE_FORMAT(encounter_date)) plus two VARCHAR columns, so no index can supply
+the order. EXPLAIN reports "Using temporary; Using filesort" on 1M rows.
+COUNT(DISTINCT patient_id) then has to de-duplicate within each group.
+
+The existing idx_encounter_date does not help, because there is no date
+filter: the query reads everything. Root cause: the reporting attribute
+(specialty) is two hops away, and the time bucket (month) has to be computed
+per row at query time.
+
+
+QUESTION 2: Top Diagnosis-Procedure Pairs
+-----------------------------------------
+
+SQL Query:
+SELECT d.icd10_code,
+       d.icd10_description,
+       pr.cpt_code,
+       pr.cpt_description,
+       COUNT(DISTINCT ed.encounter_id) AS encounter_count
+FROM encounter_diagnoses ed
+JOIN encounter_procedures ep ON ed.encounter_id = ep.encounter_id   -- junction-to-junction join
+JOIN diagnoses  d            ON ed.diagnosis_id = d.diagnosis_id
+JOIN procedures pr           ON ep.procedure_id = pr.procedure_id
+GROUP BY d.icd10_code, d.icd10_description, pr.cpt_code, pr.cpt_description
+ORDER BY encounter_count DESC
+LIMIT 10;
+
+Sample-data check: I10+99213 = 2 (encounters 7001, 7002), E11.9+99213 = 2
+(7001, 7003), E11.9+93000 = 1, I10+93000 = 1, I50.9+99213 = 1 - correct.
+
+Schema Analysis:
+- Tables joined: encounter_diagnoses, encounter_procedures, diagnoses, procedures
+- Number of joins: 3
+- How the two junction tables are combined: there is no direct link between a
+  diagnosis and a procedure. The only common column is encounter_id, so the two
+  junction tables are joined to EACH OTHER on encounter_id. This pairs every
+  diagnosis of an encounter with every procedure of the same encounter (a
+  per-encounter Cartesian product). The code tables are then joined to get the
+  ICD and CPT codes. COUNT(DISTINCT encounter_id) is needed so an encounter that
+  lists the same code twice is not double-counted.
+
+Performance:
+- Execution time: 136.38 seconds (runs: 137.91 warm-up, 136.38)
+  (reference run: 50.4 s)
+- Estimated rows scanned: ~25.5 million (measured 25,539,624 row reads)
+- Intermediate join result BEFORE grouping: 5,000,003 rows, built from
+  2.5M + 2.0M input rows
+
+Bottleneck Identified:
+Row explosion. An encounter with 4 diagnoses and 3 procedures produces 12
+joined rows. Across the dataset, the junction join produces 5.0M rows, and
+every one of them must be grouped.
+
+Three things make each of those rows expensive:
+  (a) Both junction tables are clustered on their own surrogate key
+      (encounter_diagnosis_id, encounter_procedure_id), not on encounter_id.
+      Finding "all procedures of encounter X" is therefore a secondary-index
+      lookup plus a random read of the base row. EXPLAIN shows the plan
+      driving from procedures -> encounter_procedures (via procedure_id) ->
+      encounter_diagnoses (via encounter_id): about 2M random lookups.
+  (b) The GROUP BY is on four VARCHAR columns, including two 200-character
+      descriptions. The temporary table holding 5M wide rows is large and must
+      be sorted ("Using temporary; Using filesort").
+  (c) COUNT(DISTINCT) has to de-duplicate encounter_ids inside every one of
+      about 1.2M distinct pairs.
+
+Root cause: two independent many-to-many relationships are combined at query
+time, and the work grows with diagnoses x procedures per encounter.
+
+
+QUESTION 3: 30-Day Readmission Rate
+-----------------------------------
+
+SQL Query:
+SELECT s.specialty_name,
+       COUNT(DISTINCT idx.encounter_id) AS inpatient_discharges,
+       COUNT(DISTINCT CASE WHEN r.encounter_id IS NOT NULL THEN idx.encounter_id END) AS readmissions_30d,
+       ROUND(100.0 * COUNT(DISTINCT CASE WHEN r.encounter_id IS NOT NULL THEN idx.encounter_id END)
+                   / COUNT(DISTINCT idx.encounter_id), 2) AS readmission_rate_pct
+FROM encounters idx                                   -- index admission
+JOIN providers   p ON idx.provider_id = p.provider_id
+JOIN specialties s ON p.specialty_id  = s.specialty_id
+LEFT JOIN encounters r                                -- self-join: the return visit
+       ON  r.patient_id      = idx.patient_id
+       AND r.encounter_type  = 'Inpatient'
+       AND r.encounter_id   <> idx.encounter_id
+       AND r.encounter_date  > idx.discharge_date
+       AND r.encounter_date <= idx.discharge_date + INTERVAL 30 DAY
+WHERE idx.encounter_type = 'Inpatient'
+  AND idx.discharge_date IS NOT NULL
+GROUP BY s.specialty_name
+ORDER BY readmission_rate_pct DESC;
+
+How a readmission is detected (definition used):
+- Index stay = an encounter with encounter_type = 'Inpatient' and a
+  discharge_date.
+- Readmission = the SAME patient has another Inpatient encounter whose
+  encounter_date is AFTER the index discharge_date and no more than 30 days
+  later.
+- The encounters table is joined to itself (alias idx = the original stay,
+  alias r = a possible return) on patient_id with that date-range condition.
+  A LEFT JOIN keeps stays with no return, so they still count in the
+  denominator.
+- COUNT(DISTINCT idx.encounter_id) is required. A stay followed by two
+  returns within 30 days would otherwise be counted twice.
+- The readmission is attributed to the specialty of the provider on the INDEX
+  stay, the usual way to hold a service accountable.
+- Assumption: "return" means another inpatient admission, which is the
+  standard (CMS-style) definition. To count any return visit (ER, outpatient),
+  remove the r.encounter_type filter.
+
+Sample-data check: the sample has one inpatient stay (7002, discharged
+2024-06-06) and no return, so the rate is 0%. To test the logic I temporarily
+added an inpatient admission for the same patient on 2024-06-20. The query
+returned Cardiology 2 discharges / 1 readmission / 50.00% - correct (7002 is
+readmitted; the new stay is not). The test row was rolled back.
+
+Schema Analysis:
+- Tables joined: encounters (twice: idx and r), providers, specialties
+- Number of joins: 3 (including 1 self-join)
+
+Performance:
+- Execution time: 13.64 seconds (runs 2-4: 13.70, 13.64, 13.42)
+  (reference run: 6.34 s)
+- Estimated rows scanned: ~2.8 million (measured 2,814,684 row reads)
+
+Bottleneck Identified:
+1. The self-join is a NON-EQUI join. Only patient_id can use an index; the
+   date window must be checked row by row. Every inpatient stay (about 150k)
+   probes the patient_id index and tests every other encounter of that patient
+   (about 10 each).
+2. There is no index on encounter_type. The plan reaches encounters through
+   specialty -> provider -> provider_id index, so it reads all 1,000,000
+   encounters (each a random clustered lookup) just to keep the 150k inpatient
+   ones.
+3. The LEFT JOIN can multiply rows (multiple returns), which forces
+   COUNT(DISTINCT) on top of a temporary table and filesort.
+4. Most importantly, the readmission logic is RE-DERIVED on every run, even
+   though the answer for past stays never changes.
+
+Root cause: a self-join on a large table with a range predicate, recomputed at
+query time.
+
+
+QUESTION 4: Revenue by Specialty & Month
+----------------------------------------
+
+SQL Query:
+SELECT DATE_FORMAT(e.encounter_date, '%Y-%m') AS service_month,
+       s.specialty_name,
+       SUM(b.allowed_amount) AS total_allowed,
+       SUM(b.claim_amount)   AS total_claimed,
+       COUNT(DISTINCT e.encounter_id) AS billed_encounters
+FROM billing b
+JOIN encounters  e ON b.encounter_id = e.encounter_id
+JOIN providers   p ON e.provider_id  = p.provider_id
+JOIN specialties s ON p.specialty_id = s.specialty_id
+GROUP BY DATE_FORMAT(e.encounter_date, '%Y-%m'), s.specialty_name
+ORDER BY service_month, total_allowed DESC;
+
+(Month = month of SERVICE, i.e. encounter_date, so revenue lines up with
+Question 1's volumes. For cash-basis reporting, group by claim_date instead.
+That would also let idx_claim_date help when a date range is filtered.)
+
+Sample-data check: 2024-05 Cardiology allowed 280.00; 2024-06 Cardiology
+allowed 10,000.00 - correct.
+
+To answer "which specialties generate most revenue" overall, drop the month
+from the SELECT and GROUP BY. In this synthetic data the top three are
+Pulmonology ($124.7M), Infectious Disease ($123.1M) and Psychiatry ($122.9M).
+They are close together because the generator spreads cost evenly; real data
+would differ.
+
+Schema Analysis:
+- Tables joined: billing, encounters, providers, specialties
+- Number of joins: 3
+- JOIN chain: billing -> encounters (for date and provider) -> providers (for
+  specialty_id) -> specialties (for the name)
+
+Performance:
+- Execution time: 27.66 seconds (runs 2-4: 27.75, 27.66, 27.47)
+  (reference run: 8.58 s)
+- Estimated rows scanned: ~4.6 million (measured 4,602,505 row reads)
+
+Bottleneck Identified:
+This is the longest join chain of the four queries. The money (billing) and
+the reporting attributes (month, specialty) are three hops apart. EXPLAIN
+shows: specialties -> providers -> encounters (provider_id index, random reads)
+-> billing (encounter_id secondary index, more random reads). Every one of the
+950k claims costs at least two random lookups.
+
+The GROUP BY again uses a DATE_FORMAT expression plus a VARCHAR, so the work
+goes into a temporary table and filesort. COUNT(DISTINCT) is needed because an
+encounter can have several claims.
+
+Root cause: a multi-hop JOIN chain to reach the attributes needed for
+grouping, followed by aggregation over all detail rows at query time.
+
+
+SUMMARY
+-------
+Query                     Joins   Time (MySQL)  Time (ref.)  Rows read   Main cause
+Q1 Monthly encounters       2      11.22 s       4.52 s     2.49 M     join chain + GROUP BY on expression
+Q2 Dx-Px pairs              3     136.38 s      50.45 s    25.54 M     junction-to-junction row explosion (5.0M rows)
+Q3 Readmission rate         3      13.64 s       6.34 s     2.81 M     non-equi self-join, recomputed every run
+Q4 Revenue by specialty     3      27.66 s       8.58 s     4.60 M     longest join chain (4 tables) + aggregation
+
+Common pattern: every plan shows "Using temporary; Using filesort", and every
+plan walks specialty -> provider -> encounter through secondary indexes,
+because the attribute analysts group by most (specialty) is not on the
+encounter row. Normalization is correct for writes, where each fact is stored
+once. For reads, the same structure makes every analytical query rebuild the
+relationships from scratch.
