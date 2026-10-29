@@ -1,0 +1,181 @@
+HEALTHCARE ANALYTICS LAB - PART 3.1: STAR SCHEMA DESIGN DECISIONS
+=================================================================
+
+DECISION 1: FACT TABLE GRAIN
+----------------------------
+Choice: OPTION A - one row per encounter (fact_encounters).
+
+Why this is best for the four questions:
+
+- Q1 (encounters and unique patients by month, specialty, type) counts
+  ENCOUNTERS. At encounter grain, COUNT(*) is the answer. At diagnosis grain
+  (Option B) or procedure grain (Option C) every encounter is repeated 1-4
+  times, so every count would need COUNT(DISTINCT encounter) to undo the
+  duplication.
+
+- Q4 (revenue) sums billing per encounter. At Option B or C grain the billed
+  amount would be repeated on each diagnosis or procedure row and SUM() would
+  overstate revenue unless the dollars were split or allocated, which is
+  error-prone. At encounter grain each dollar appears exactly once.
+
+- Q3 (readmissions) is an encounter-to-encounter relationship. One row per
+  stay lets the ETL store a single readmitted_within_30d flag, and the query
+  becomes SUM(flag) / COUNT(*).
+
+- Q2 (diagnosis-procedure pairs) is the only question that needs detail below
+  the encounter. Option B would serve diagnoses but not procedures, and Option
+  C the reverse; neither covers both. Bridge tables hang both lists off the
+  encounter-grain fact without changing its grain (Decision 4).
+
+- Size: 1,000,000 encounter rows versus 2,500,000 rows (B) or 2,000,000 rows
+  (C), with no information lost.
+
+Encounter grain is the "natural" business event: an admission or visit is
+what operations, finance and quality all count.
+
+
+DECISION 2: DIMENSION TABLES
+----------------------------
+All dimensions use an integer SURROGATE key. The OLTP id is kept as the
+natural key for lookups. Key 0 in every dimension is an "Unknown" member, so
+fact foreign keys are never NULL and inner joins never silently drop rows.
+
+dim_date (static, one row per day 2015-01-01 .. 2030-12-31 = 5,844 rows)
+  date_key (YYYYMMDD smart key, e.g. 20240510), calendar_date, day_of_month,
+  day_of_week, day_name, is_weekend, week_of_year, month_num, month_name,
+  month_label ('2024-05'), month_key (202405), quarter_num, year_quarter
+  ('2024-Q2'), year_num.
+  Why: months, quarters and weekends are pre-computed once instead of
+  DATE_FORMAT() on every row of every query. The YYYYMMDD key is readable, and
+  date_key DIV 100 gives the month directly.
+  Role-playing: the fact references it twice (encounter_date_key,
+  discharge_date_key), and the procedure bridge once (procedure_date_key).
+
+dim_patient (SCD Type 2)
+  patient_key, patient_id (natural key), mrn, first_name, last_name,
+  full_name, date_of_birth, birth_year, gender, gender_desc, age_group
+  ('0-17','18-34','35-49','50-64','65-79','80+'), effective_from,
+  effective_to, is_current, row_hash.
+  Note: age_group is the CURRENT age band, useful for "who are our patients
+  today". Age at the time of care changes with every visit, so it is stored on
+  the fact (patient_age_at_encounter).
+
+dim_provider (SCD Type 2)
+  provider_key, provider_id, first_name, last_name, full_name, credential,
+  specialty_key, specialty_name, specialty_code, department_key,
+  department_name, effective_from, effective_to, is_current, row_hash.
+  Specialty and department names are DENORMALIZED onto the provider, so a
+  provider report never needs a snowflake chain. SCD2 matters here: if Dr.
+  Chen moves from Cardiology to Internal Medicine, his past encounters must
+  stay credited to Cardiology. This was tested and works.
+
+dim_specialty (SCD Type 1)
+  specialty_key, specialty_id, specialty_name, specialty_code.
+
+dim_department (SCD Type 1)
+  department_key, department_id, department_name, floor, capacity.
+
+dim_encounter_type (static, 4 rows)
+  encounter_type_key, type_name ('Outpatient','Inpatient','ER','Unknown'),
+  care_setting ('Ambulatory','Acute','Emergency'), is_inpatient flag.
+  Why a dimension for 3 values: filters become integer comparisons, and the
+  is_inpatient flag carries business meaning (Q3 asks for "is_inpatient = 1",
+  not a hard-coded string).
+
+Others - yes:
+dim_diagnosis (SCD Type 1)
+  diagnosis_key, diagnosis_id, icd10_code, icd10_description,
+  icd10_category (first 3 characters, e.g. 'I50'), icd10_chapter (first
+  letter, e.g. 'I' = circulatory). The category and chapter allow roll-ups
+  that the OLTP cannot do without string functions.
+dim_procedure (SCD Type 1)
+  procedure_key, procedure_id, cpt_code, cpt_description.
+
+
+DECISION 3: PRE-AGGREGATED METRICS ON THE FACT
+----------------------------------------------
+Stored on every fact_encounters row, computed once by the ETL:
+
+  diagnosis_count          COUNT of encounter_diagnoses rows
+  procedure_count          COUNT of encounter_procedures rows
+  claim_count              COUNT of billing rows
+  total_claim_amount       SUM(billing.claim_amount)
+  total_allowed_amount     SUM(billing.allowed_amount)
+  length_of_stay_hours     discharge - admission, in hours
+  length_of_stay_days      calendar days (inpatient LOS)
+  patient_age_at_encounter age on the encounter date
+  is_inpatient             flag
+  readmitted_within_30d    1 if THIS inpatient stay was followed by another
+                           inpatient admission within 30 days of discharge
+  is_readmission           1 if THIS stay is itself a readmission
+  days_to_next_admission   days from discharge to the next admission
+  primary_diagnosis_key    the diagnosis with sequence = 1 (a dimension key,
+                           kept for convenience)
+
+Also: specialty_key is stored DIRECTLY on the fact, copied from the
+provider's specialty version at the time of the encounter. It is not a metric,
+but it is the single most important denormalization. Every one of the four
+questions groups by specialty, and this removes the encounter -> provider ->
+specialty hop that dominated all four OLTP plans.
+
+Why pre-aggregating helps:
+- It turns query-time JOIN + GROUP BY into a column read. Q4 in the OLTP
+  joins 950k billing rows to encounters and aggregates; in the star schema the
+  sum per encounter already exists, so Q4 reads one integer-keyed index.
+- It moves expensive logic to the ETL, where it runs once. The readmission
+  self-join is the extreme case: it cost 13.6 s per OLTP query on MySQL. In the star
+  schema it runs once per load and Q3 becomes SUM(readmitted_within_30d), now
+  0.22 s (63x faster).
+- It makes metrics consistent. Every analyst gets the same readmission
+  definition and the same LOS calculation, instead of each rewriting it
+  slightly differently.
+- It enables covering indexes. Because the measures live on the fact row, they
+  can be INCLUDED in an index, and queries never touch the base table (see
+  star_schema.sql).
+- Additivity: all stored amounts and counts are additive, so they can be
+  summed safely at any level (month, specialty, department). Flags are
+  0/1, so SUM(flag)/COUNT(*) gives a correct rate at any level.
+
+What I deliberately did NOT pre-aggregate on the fact: unique patient counts.
+COUNT(DISTINCT) is not additive; daily distinct counts cannot be summed into
+monthly distinct counts. Q1 computes it at query time from patient_key.
+
+
+DECISION 4: BRIDGE TABLES
+-------------------------
+Choice: YES - bridge_encounter_diagnoses and bridge_encounter_procedures, plus
+an optional aggregate table, agg_diagnosis_procedure_pairs.
+
+Why bridges:
+- Encounters to diagnoses and encounters to procedures are genuinely
+  many-to-many (1-4 diagnoses, 1-3 procedures per encounter). Putting them
+  into the encounter-grain fact would mean either
+    (a) fixed columns (dx1..dx10, px1..px10): wide, mostly NULL, impossible to
+        query "any encounter with code X" without OR-ing 10 columns, and it
+        breaks when an encounter has 11 codes; or
+    (b) changing the grain to dx x px rows, which inflates the fact and
+        double-counts revenue and encounters (see Decision 1).
+- Bridges keep the fact clean for Q1, Q3 and Q4, which never touch them, while
+  still supporting diagnosis or procedure analysis (Q2, "encounters with
+  diabetes", "average LOS for heart failure").
+
+Design details that make the bridges faster than the OLTP junction tables:
+- Clustered PRIMARY KEY (encounter_key, sequence). All codes of one encounter
+  are physically together, so joining the two bridges on encounter_key is a
+  sequential, index-ordered match. In the OLTP, the junction tables are
+  clustered by their own surrogate id, which forces random lookups.
+- Integer keys only: diagnosis_key and procedure_key are joined to code
+  dimensions AFTER the pairs are grouped, and only for the final 10 rows.
+- Secondary indexes (diagnosis_key, encounter_key) and (procedure_key,
+  encounter_key) support "find all encounters with code X".
+- is_primary on the diagnosis bridge supports primary-diagnosis analysis.
+
+Why also an aggregate table for Q2:
+The bridges cannot remove the row explosion. Pairing every diagnosis with
+every procedure of an encounter still produces 5.0M rows, so the bridge
+version of Q2 is faster (36.5 s vs 136.4 s on MySQL) but not fast. Because the pair
+counts only change when new encounters load, the ETL materializes
+agg_diagnosis_procedure_pairs (about 1.2M rows) once per load, and the report
+reads the top 10 from an index in under 1 ms. This is the standard approach:
+keep the bridge as the flexible detail layer, and add a summary table for a
+heavy query that runs repeatedly.
