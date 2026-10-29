@@ -1,0 +1,241 @@
+HEALTHCARE ANALYTICS LAB - PART 3.4: ETL DESIGN
+===============================================
+
+This design is implemented and tested, not only described. The working ETL is
+sql/etl_load_template.sql (source schema = __SRC__ placeholder), with ready-to-run
+copies sql/04_etl_load_full.sql and sql/05_etl_load_incremental.sql (source =
+healthtech_oltp_big). Measured on 1M encounters:
+  - Full load:                 about 19.7 min on MySQL 8 / Windows laptop
+                               (176 s on the MariaDB reference server); the
+                               longest step is the fact upsert (407 s on MySQL)
+  - Incremental load:          ~1 s on the reference server (45-day lookback,
+                               one late-arriving claim)
+  - Re-running either mode:    no duplicates (idempotent)
+  - Reconciliation after load: encounter count, $ allowed total, and diagnosis
+    and procedure link counts all equal the source; 0 fact rows fell back to
+    "Unknown" keys.
+
+Load order (dependencies first):
+  dim_date -> Type-1 dims (specialty, department, diagnosis, procedure)
+  -> SCD-2 dims (patient, provider) -> encounter batch -> staging aggregates
+  -> fact upsert -> bridges -> aggregate table -> ANALYZE (refresh optimizer stats)
+
+
+1. DIMENSION LOAD LOGIC
+-----------------------
+
+1a. dim_date (one-time load)
+  Generate one row per day from 2015-01-01 to 2030-12-31 (5,844 rows) and
+  derive every attribute once:
+      for each date d in range:
+          date_key     = YYYYMMDD(d)          -- smart key, e.g. 20240510
+          month_label  = 'YYYY-MM'; month_key = YYYYMM
+          quarter, year_quarter, week_of_year, day_name, is_weekend, ...
+          INSERT IGNORE (re-running is harmless)
+  Plus a key-0 "Unknown" row for missing dates. To extend the range later,
+  run the same insert with a new end date.
+
+  Lesson learned: my first version used a recursive CTE. MariaDB stops
+  recursion at 1,000 iterations by default WITHOUT raising an error, so the
+  table silently ended in September 2017 and every 2022-2024 encounter got
+  date_key 0. I replaced it with a digits cross-join (0-9,999), which works
+  on any MySQL/MariaDB version. A row-count check after the load would catch
+  this kind of bug.
+
+1b. Type-1 dimensions (specialty, department, diagnosis, procedure)
+  Upsert by natural key; history is not needed (a corrected description
+  should apply everywhere):
+      INSERT INTO dim_x (natural_id, attributes...) SELECT ... FROM source
+      ON DUPLICATE KEY UPDATE attributes = new values
+  Derived columns are computed here: icd10_category = first 3 characters,
+  icd10_chapter = first letter.
+
+1c. dim_patient - how it is populated from patients (SCD Type 2)
+  Step 1. Stage and clean every source patient:
+      full_name   = TRIM(first_name + ' ' + last_name)
+      gender      = UPPER(gender); gender_desc = Male/Female/Unknown
+      birth_year  = YEAR(date_of_birth)
+      age_group   = band of current age (0-17, 18-34, 35-49, 50-64, 65-79,
+                    80+, or 'Unknown' if DOB missing)
+      row_hash    = MD5(date_of_birth | gender | mrn)   -- the Type-2 attributes
+  Step 2. Type-1 changes (name fixes, age band) where the hash is unchanged:
+      overwrite in place on the current row.
+  Step 3. Type-2 changes where the hash differs:
+      close the current row: is_current = 0, effective_to = yesterday.
+  Step 4. Insert a new current row for every patient with no current row
+      (new patients, and the patients just closed in step 3):
+      effective_from = '1900-01-01' if brand new, otherwise today;
+      effective_to = '9999-12-31'; is_current = 1.
+
+1d. dim_provider (SCD Type 2), same pattern
+  The staging step looks up and DENORMALIZES specialty_key/name and
+  department_key/name. The hash covers credential, specialty_id and
+  department_id. Tested: moving provider 101 from Cardiology to Internal
+  Medicine produced two rows (Cardiology, closed yesterday; Internal Medicine,
+  current from today). Encounters before the change kept Cardiology.
+
+1e. How dimension updates are handled (summary)
+  dim_date, dim_encounter_type   static (extend or seed only)
+  specialty, department,         Type 1: overwrite; history not analytically
+  diagnosis, procedure           meaningful
+  patient                        Type 2 on DOB/gender/MRN, Type 1 on name
+  provider                       Type 2 on specialty/department/credential,
+                                 because reporting must credit the specialty
+                                 the provider had AT THE TIME of the encounter
+  Change detection uses one MD5 hash per row instead of comparing every column.
+
+
+2. FACT TABLE LOAD LOGIC
+------------------------
+
+2a. Choose the batch of encounters to process (stg_encounter_batch)
+  FULL mode:        all encounters.
+  INCREMENTAL mode: the union of
+    - encounters admitted or discharged in the last N days (default 45),
+    - encounters with billing rows whose claim_date is in the window (late
+      claims),
+    - earlier inpatient stays of the same patients that were discharged
+      within 30 days before a batch encounter (their readmission flag may
+      change from 0 to 1 because of the new admission).
+
+2b. Pre-aggregate the child tables to encounter grain (staging tables)
+      stg_dx:   per encounter_id -> COUNT(*) diagnosis_count,
+                diagnosis_id where sequence = 1 (primary diagnosis)
+      stg_px:   per encounter_id -> COUNT(*) procedure_count
+      stg_bill: per encounter_id -> COUNT(*) claim_count,
+                SUM(claim_amount), SUM(allowed_amount)
+  Lesson learned: in MySQL, CREATE TABLE t (cols) AS SELECT matches columns BY
+  NAME. My unaliased COUNT(*)/SUM() landed in extra columns and every billing
+  total loaded as 0. Always alias staging columns. Reconciling totals against
+  the source caught this.
+
+2c. Compute readmission metrics (stg_readmit), once per load
+      for each inpatient stay e in the batch with a discharge_date:
+          next_admit = MIN(encounter_date) of the same patient's OTHER
+                       inpatient encounters with encounter_date > e.discharge
+          readmitted_within_30d = next_admit <= e.discharge + 30 days
+          days_to_next_admission = DATEDIFF(next_admit, e.discharge)
+          is_readmission = EXISTS another inpatient stay of this patient
+                           discharged within the 30 days before e started
+  The "earliest next admission falls within 30 days" test is logically the
+  same as the OLTP self-join's "any admission within 30 days". Q3 results
+  were verified to be identical.
+
+2d. For each encounter, look up the dimension keys
+      encounter_date_key  = dim_date on YYYYMMDD(encounter_date)
+      discharge_date_key  = dim_date on YYYYMMDD(discharge_date)
+      patient_key         = dim_patient WHERE patient_id = e.patient_id
+                            AND encounter_date BETWEEN effective_from AND effective_to
+      provider_key        = dim_provider, same "as-of" rule (point-in-time lookup)
+      specialty_key       = taken from THAT provider version (denormalized onto fact)
+      department_key      = dim_department on e.department_id,
+                            falling back to the provider's department
+      encounter_type_key  = dim_encounter_type on type_name
+      primary_diagnosis_key = dim_diagnosis on stg_dx.primary_diagnosis_id
+  All lookups are LEFT JOINs wrapped in COALESCE(key, 0).
+
+2e. Calculate the derived metrics
+      diagnosis_count / procedure_count / claim_count / totals <- staging (0 if none)
+      length_of_stay_hours = minutes(discharge - admit) / 60   (NULL if invalid)
+      length_of_stay_days  = DATEDIFF(discharge, admit)
+      patient_age_at_encounter = whole years from DOB to encounter_date
+      is_inpatient         = from dim_encounter_type
+      readmission columns  = from stg_readmit (0 if not inpatient)
+
+2f. Write with an upsert keyed on encounter_id (unique degenerate key)
+      INSERT ... ON DUPLICATE KEY UPDATE all columns, etl_updated_at = now
+  A re-run or a late correction updates the row in place and never creates a
+  duplicate.
+
+2g. How missing data is handled
+  Missing reference (unknown provider, bad code)  -> key 0 "Unknown" member;
+                                                     the row is kept, never dropped
+  Missing discharge_date (patient still admitted) -> discharge_date_key = 0,
+      LOS = NULL, excluded from readmission denominators; re-processed when
+      the discharge arrives (it falls inside the incremental window)
+  Discharge before admission (bad data)           -> LOS = NULL instead of a negative number
+  Missing DOB                                     -> age NULL, age_group 'Unknown'
+  No billing yet                                  -> claim_count 0, amounts 0;
+                                                     filled when claims arrive
+  No diagnoses / procedures                       -> counts 0, primary_diagnosis_key 0
+  Duplicate or NULL diagnosis_sequence            -> ROW_NUMBER() assigns a clean sequence
+  Data-quality checks after each load: row counts and $ totals versus source,
+  and the number of key-0 rows (alert if above a threshold).
+
+
+3. BRIDGE TABLE LOAD LOGIC
+--------------------------
+Bridges load AFTER the fact, because they need its encounter_key.
+
+  stg_batch_keys = (encounter_key, encounter_id) for every fact row in the batch
+
+3a. bridge_encounter_diagnoses
+      DELETE bridge rows WHERE encounter_key IN stg_batch_keys
+      INSERT for each source encounter_diagnoses row of those encounters:
+          encounter_key      <- stg_batch_keys
+          diagnosis_sequence <- ROW_NUMBER() OVER (PARTITION BY encounter
+                                ORDER BY diagnosis_sequence, source id)
+          diagnosis_key      <- dim_diagnosis lookup (0 if unknown)
+          is_primary         <- (source diagnosis_sequence = 1)
+
+3b. bridge_encounter_procedures
+      Same delete-then-insert pattern:
+          procedure_line     <- ROW_NUMBER() per encounter ordered by procedure_date
+          procedure_key      <- dim_procedure lookup (0 if unknown)
+          procedure_date_key <- dim_date lookup on procedure_date
+
+  Why delete-and-reinsert instead of upsert: the source is a list per
+  encounter. If a coder removes a diagnosis, an upsert would leave the stale
+  row behind. Replacing the encounter's whole list is simple and always
+  correct, and it is cheap because only batch encounters are touched.
+
+3c. agg_diagnosis_procedure_pairs (optional aggregate for Q2)
+      TRUNCATE, then INSERT diagnosis_key, procedure_key,
+      COUNT(DISTINCT encounter_key) from the two bridges joined on encounter_key.
+  Full rebuild (~10 s), nightly. A production version could rebuild only the
+  pairs touched by the batch.
+
+
+4. REFRESH STRATEGY
+-------------------
+
+4a. How often
+  - Incremental load NIGHTLY (e.g. 02:00), after the day's charting and coding
+    settle. These reports are monthly and quarterly trends, so overnight
+    freshness is enough, and a nightly run avoids load on the clinical system
+    during the day.
+  - Full refresh WEEKLY or monthly as a safety net (about 20 min at 1M
+    encounters on a laptop, 3 min on a server),
+    and whenever logic changes (e.g. a new readmission definition) so history
+    is recomputed consistently.
+  - For near-real-time needs (ED census), use a separate operational feed,
+    not this warehouse.
+  - Production improvement: the OLTP tables have no updated_at columns, so the
+    incremental window is date-based. With change data capture (binlog) or
+    last_modified columns, the batch could be exactly "rows changed since the
+    last watermark", stored in an etl_control table.
+
+4b. Late-arriving facts
+  Healthcare data is late by nature: claims are filed days or weeks after
+  discharge, coders add diagnoses after the visit, and readmissions are only
+  known up to 30 days later.
+  - The lookback window (45 days, above the 30-day readmission window plus
+    typical claim lag) re-processes recent encounters every night.
+  - Encounters with new claims are pulled in by claim_date even when the
+    visit is older than the window.
+  - The upsert updates the existing fact row instead of inserting a new one
+    (etl_updated_at records when). Tested: a claim added today for an old,
+    unbilled encounter updated that row from $0 to $700 in a ~1 s run, with
+    no duplicate row.
+  - Earlier stays of re-admitted patients are re-processed, so a stay's
+    readmitted_within_30d flips to 1 when the readmission arrives.
+  - Late-arriving DIMENSIONS (an encounter for a patient not yet loaded):
+    dimensions load before facts in every run, so this is rare; if it happens
+    the fact gets key 0 and is fixed when the encounter falls into a later
+    batch. An "inferred member" (placeholder dimension row) is the
+    alternative.
+  - Very old corrections (beyond the window) are caught by the periodic full
+    refresh.
+  - Reporting note: the most recent ~30 days of readmission rates are
+    provisional, because readmissions may not have happened yet. Dashboards
+    should label them so.
