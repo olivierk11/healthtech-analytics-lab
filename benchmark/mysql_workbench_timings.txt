@@ -1,0 +1,26 @@
+# Timings from MySQL 8 + MySQL Workbench on a Windows laptop (2 GB InnoDB buffer pool).
+# Source: Workbench Output panel, "Duration" column (server execution time, excludes
+# grid fetch). Each query was run 4 times; run 1 is a cache warm-up and is excluded.
+# Median of runs 2-4 is reported (Q2 OLTP and Q2 bridge: 2 runs, the 2nd is used).
+# These are the PRIMARY numbers in the deliverables.
+
+OLTP (default schema healthtech_oltp_big)        all runs (s)                         used (s)
+oltp_q1.sql   2160 rows   12.266 | 11.766  11.218  11.047          11.218
+oltp_q2.sql     10 rows  137.907 | 136.375                         136.375
+oltp_q3.sql     20 rows   14.531 | 13.703  13.641  13.422          13.641
+oltp_q4.sql    720 rows   20.688 | 27.750  27.656  27.468          27.656
+
+STAR (default schema healthtech_dw)
+star_q1.sql   2160 rows    2.625 |  2.485   2.515   2.562           2.515
+star_q2.sql     10 rows   38.750 | 36.547                          36.547
+star_q2_agg.sql 10 rows    0.000 |  0.000   0.000   0.000          < 0.001 (below Workbench's 1 ms resolution)
+star_q3.sql     20 rows    0.172 |  0.235   0.172   0.218           0.218
+star_q4.sql    720 rows    3.563 |  3.406   3.484   3.531           3.484
+
+SPEEDUP (OLTP / star):  Q1 4.5x   Q2 bridges 3.7x   Q2 aggregate >100,000x   Q3 63x   Q4 7.9x
+
+Load times on the same machine:
+  sql/03_generate_big_data.sql   ~10 min  (16:43:15 -> 16:53:00)
+  sql/04_etl_load_full.sql       ~19.7 min (18:02:44 -> 18:22:24); fact upsert 406.9 s,
+                                 diagnosis bridge 181.7 s, procedure bridge 188.1 s,
+                                 pair aggregate 97.0 s
