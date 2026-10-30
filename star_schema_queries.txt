@@ -1,0 +1,228 @@
+HEALTHCARE ANALYTICS LAB - PART 3.3: QUERIES REWRITTEN FOR THE STAR SCHEMA
+=========================================================================
+
+Same environments and data as query_analysis.txt. PRIMARY numbers: MySQL 8 +
+Workbench on a Windows laptop (median of runs 2-4); REFERENCE numbers: MariaDB
+10.11 on Linux. 1,000,000
+encounters, warm buffer pool, median of 3 runs (2 for the slow bridge version
+of Q2). All times are MEASURED, not estimated. Every star query returned
+results IDENTICAL to its OLTP version (checked row by row with
+sql/compare_results.sql: same row count, zero mismatched rows).
+
+HOW THE QUERIES ARE WRITTEN: "AGGREGATE FIRST, THEN JOIN"
+-------------------------------------------------------
+(Reference run.) My first versions were textbook star joins (fact JOIN dim_date JOIN
+dim_specialty JOIN dim_encounter_type ... GROUP BY labels). They were only
+2-3x faster than the OLTP:
+
+    first attempt:  Q1 2.55 s   Q3 2.46 s   Q4 3.13 s   Q2-agg 2.10 s
+
+EXPLAIN showed why. MySQL/MariaDB started from the small dimensions,
+cross-joined them (4 types x 21 specialties x 5,852 dates = about 491k
+combinations) and probed the fact table once per combination.
+
+The fix is to GROUP BY the fact table's integer keys inside a derived table,
+using a covering index so the base rows are never read, and only then join the
+dimensions to the few hundred result rows to get labels. The final versions
+below use this pattern. EXPLAIN shows "Using index" on the fact table in every
+one.
+
+
+QUESTION 1: Monthly Encounters by Specialty
+-------------------------------------------
+SQL:
+SELECT d.month_label    AS encounter_month,
+       s.specialty_name,
+       t.type_name      AS encounter_type,
+       agg.total_encounters,
+       agg.unique_patients
+FROM (
+    -- aggregate the fact on integer keys only (covering index idx_fact_date_spec_type)
+    SELECT f.encounter_date_key DIV 100       AS month_key,     -- smart key YYYYMMDD -> YYYYMM
+           f.specialty_key,
+           f.encounter_type_key,
+           COUNT(*)                           AS total_encounters,
+           COUNT(DISTINCT f.patient_key)      AS unique_patients
+    FROM fact_encounters f
+    GROUP BY f.encounter_date_key DIV 100, f.specialty_key, f.encounter_type_key
+) agg
+JOIN (SELECT DISTINCT month_key, month_label FROM dim_date) d ON d.month_key = agg.month_key
+JOIN dim_specialty      s ON s.specialty_key      = agg.specialty_key
+JOIN dim_encounter_type t ON t.encounter_type_key = agg.encounter_type_key
+ORDER BY encounter_month, s.specialty_name, encounter_type;
+
+Execution time:     2.52 s   (OLTP: 11.22 s)   [reference: 0.64 s vs 4.52 s]
+Improvement factor: 4.5x faster                 [reference: 7.0x]
+Rows read:          1.02 M   (OLTP: 2.49 M)
+
+Why it is faster:
+- Fewer joins on the big table. specialty_key and encounter_type_key are ON
+  the fact row, so the encounter -> provider -> specialty chain (1M random
+  lookups in the OLTP) is gone. The dimensions are joined only to the
+  aggregated result (about 2,160 rows), not to 1M rows.
+- Pre-computed date attributes. Month comes from the smart date_key
+  (YYYYMMDD DIV 100) instead of DATE_FORMAT() on every row; labels come from
+  dim_date.
+- Covering index. idx_fact_date_spec_type (encounter_date_key, specialty_key,
+  encounter_type_key, patient_key) holds every column the query needs, so the
+  engine scans one narrow integer index and never touches the 400 MB table.
+- What is left: COUNT(DISTINCT patient_key) still has to be computed at
+  query time, because distinct counts cannot be pre-summed.
+
+
+QUESTION 2: Top Diagnosis-Procedure Pairs
+-----------------------------------------
+Version A - through the bridge tables (the pure star design):
+WITH top_pairs AS (
+    SELECT bdx.diagnosis_key, bpx.procedure_key,
+           COUNT(DISTINCT bdx.encounter_key) AS encounter_count
+    FROM bridge_encounter_diagnoses  bdx
+    JOIN bridge_encounter_procedures bpx ON bpx.encounter_key = bdx.encounter_key
+    GROUP BY bdx.diagnosis_key, bpx.procedure_key
+    ORDER BY encounter_count DESC
+    LIMIT 10
+)
+SELECT dx.icd10_code, dx.icd10_description, px.cpt_code, px.cpt_description, tp.encounter_count
+FROM top_pairs tp
+JOIN dim_diagnosis dx ON dx.diagnosis_key = tp.diagnosis_key
+JOIN dim_procedure px ON px.procedure_key = tp.procedure_key
+ORDER BY tp.encounter_count DESC;
+
+Execution time:     36.55 s  (OLTP: 136.38 s)  [reference: 7.43 s vs 50.4 s]
+Improvement factor: 3.7x faster                 [reference: 6.8x]
+Rows read:          20.2 M   (OLTP: 25.5 M)
+
+Version B - from the pre-aggregated pairs table (rebuilt by ETL each load):
+SELECT dx.icd10_code, dx.icd10_description, px.cpt_code, px.cpt_description, top.encounter_count
+FROM (
+    SELECT diagnosis_key, procedure_key, encounter_count
+    FROM agg_diagnosis_procedure_pairs
+    ORDER BY encounter_count DESC
+    LIMIT 10                                   -- reads 10 entries from idx_agg_pair_count
+) top
+JOIN dim_diagnosis dx ON dx.diagnosis_key = top.diagnosis_key
+JOIN dim_procedure px ON px.procedure_key = top.procedure_key
+ORDER BY top.encounter_count DESC;
+
+Execution time:     < 1 ms   (Workbench shows 0.000 sec; OLTP: 136.38 s)
+                                                [reference: 0.42 ms vs 50.4 s]
+Improvement factor: over 100,000x faster        [reference: ~120,000x]
+Rows read:          49
+
+Why it is faster:
+- Version A: better physical layout, not fewer rows. Both bridges are
+  clustered on (encounter_key, sequence), so all codes of an encounter sit
+  together and the bridge-to-bridge join is an ordered index match instead of
+  2M random lookups. Grouping is on two INTs instead of four VARCHARs
+  (including two 200-character descriptions), so the temporary table is far
+  smaller. Code descriptions are joined for the final 10 rows only.
+- Version A still produces the 5.0M-row explosion, which is why it takes
+  seconds, not milliseconds. The explosion is inherent to "pair every
+  diagnosis with every procedure".
+- Version B: the explosion is paid ONCE in the ETL. The query reads the top 10
+  entries of idx_agg_pair_count and joins 2 dimensions: pure pre-aggregation.
+
+
+QUESTION 3: 30-Day Readmission Rate
+-----------------------------------
+SQL:
+SELECT s.specialty_name,
+       agg.inpatient_discharges,
+       agg.readmissions_30d,
+       ROUND(100.0 * agg.readmissions_30d / agg.inpatient_discharges, 2) AS readmission_rate_pct
+FROM (
+    SELECT f.specialty_key,
+           COUNT(*)                     AS inpatient_discharges,
+           SUM(f.readmitted_within_30d) AS readmissions_30d   -- pre-computed in ETL: no self-join
+    FROM fact_encounters f
+    WHERE f.encounter_type_key IN (SELECT encounter_type_key FROM dim_encounter_type WHERE is_inpatient = 1)
+      AND f.discharge_date_key <> 0
+    GROUP BY f.specialty_key
+) agg
+JOIN dim_specialty s ON s.specialty_key = agg.specialty_key
+ORDER BY readmission_rate_pct DESC;
+
+Execution time:     0.218 s  (OLTP: 13.64 s)   [reference: 0.059 s vs 6.34 s]
+Improvement factor: 63x faster                  [reference: 107x]
+Rows read:          0.30 M   (OLTP: 2.81 M)
+
+Why it is faster:
+- The self-join is gone. readmitted_within_30d is computed once by the ETL
+  (same definition as the OLTP query, verified to give identical results), so
+  the query is SUM(flag) / COUNT(*).
+- Selective covering index. idx_fact_readmit_cover (encounter_type_key,
+  specialty_key, discharge_date_key, readmitted_within_30d) lets the engine
+  jump straight to the 150k inpatient rows and read them from the index. The
+  OLTP had to read all 1M encounters because it had no encounter_type index.
+- No COUNT(DISTINCT), because one fact row = one stay, so no de-duplication
+  is needed.
+- This is the largest gain because the OLTP query's cost was LOGIC (a
+  non-equi self-join), and the logic was moved to load time.
+
+
+QUESTION 4: Revenue by Specialty & Month
+----------------------------------------
+SQL:
+SELECT d.month_label AS service_month,
+       s.specialty_name,
+       agg.total_allowed,
+       agg.total_claimed,
+       agg.billed_encounters
+FROM (
+    SELECT f.encounter_date_key DIV 100   AS month_key,
+           f.specialty_key,
+           SUM(f.total_allowed_amount)    AS total_allowed,      -- pre-aggregated per encounter in ETL
+           SUM(f.total_claim_amount)      AS total_claimed,
+           COUNT(*)                       AS billed_encounters
+    FROM fact_encounters f
+    WHERE f.claim_count > 0
+    GROUP BY f.encounter_date_key DIV 100, f.specialty_key
+) agg
+JOIN (SELECT DISTINCT month_key, month_label FROM dim_date) d ON d.month_key = agg.month_key
+JOIN dim_specialty s ON s.specialty_key = agg.specialty_key
+ORDER BY service_month, agg.total_allowed DESC;
+
+Execution time:     3.48 s   (OLTP: 27.66 s)   [reference: 0.62 s vs 8.58 s]
+Improvement factor: 7.9x faster                 [reference: 13.8x]
+Rows read:          1.96 M   (OLTP: 4.60 M)
+
+Why it is faster:
+- Three joins eliminated. The OLTP chain was billing -> encounters ->
+  providers -> specialties, with two random lookups per claim. Billing is
+  pre-aggregated per encounter (total_allowed_amount, total_claim_amount,
+  claim_count) and specialty is on the fact, so no hop is needed.
+- No COUNT(DISTINCT) for billed encounters: one fact row = one encounter, so
+  COUNT(*) is exact.
+- Covering index with the measures included. idx_fact_rev_cover
+  (encounter_date_key, specialty_key, claim_count, total_allowed_amount,
+  total_claim_amount) answers the whole query from the index.
+
+
+SUMMARY
+-------
+                       OLTP  Star  |----- MySQL 8 (primary) -----|  |---- MariaDB (reference) ----|
+Query                  joins joins*|  OLTP      Star      Speedup |  OLTP     Star      Speedup
+Q1 Monthly encounters    2    3    |  11.22 s   2.52 s      4.5x  |  4.52 s   0.64 s      7.0x
+Q2 Pairs (bridges)       3    3    | 136.38 s  36.55 s      3.7x  |  50.4 s   7.43 s      6.8x
+Q2 Pairs (agg table)     3    2    | 136.38 s   < 1 ms  >100,000x |  50.4 s   0.42 ms ~120,000x
+Q3 Readmission rate      3    1    |  13.64 s   0.218 s      63x  |  6.34 s   0.059 s     107x
+Q4 Revenue               3    2    |  27.66 s   3.48 s      7.9x  |  8.58 s   0.62 s     13.8x
+
+Why the MySQL speedups are smaller: the OLTP-to-star ranking is identical on
+both engines, but MySQL 8 executed the star queries' GROUP BY on the fact table
+more slowly relative to its OLTP plans than MariaDB did. The size of the gain
+depends on the engine's optimizer and the hardware; the direction and the
+ordering of the gains (Q3 and the pair aggregate largest, the Q2 bridge version
+smallest) do not.
+
+* The star join count looks similar, but the joins are different in kind. Star
+  joins attach small dimensions (4-5,852 rows) to an already aggregated
+  result. OLTP joins are 1M-row-to-1M-row hops made before aggregation. What
+  matters is how many rows go through each join, not the number of JOIN
+  keywords.
+
+Main reasons, ranked by impact in these tests:
+  1. Logic moved to ETL (readmission flag, pair aggregate)   -> 63x and up
+  2. Denormalization (specialty and billing onto the fact)   -> removes join chains
+  3. Covering indexes on integer keys + aggregate-first SQL  -> without these,
+                                                               only 2-3x
