@@ -1,0 +1,15 @@
+# Raw timing output from the reference run (MariaDB 10.11, 2 GB buffer pool, warm cache,
+# 1,000,000 encounters). Produced by scripts/time_query.sh. These are the numbers used
+# in query_analysis.txt, star_schema_queries.txt and reflection.md.
+oltp_q1.sql   runs_ms=[4518.6 4230.0 4519.0]     median_ms=4518.6   rows_read=2485982
+oltp_q2.sql   runs_ms=[51625.7 50446.5]          median_ms=50446.5  rows_read=25539624
+oltp_q3.sql   runs_ms=[6344.9 5863.1 6782.1]     median_ms=6344.9   rows_read=2814684
+oltp_q4.sql   runs_ms=[8957.5 8501.0 8583.1]     median_ms=8583.1   rows_read=4602505
+star_q1.sql   runs_ms=[640.7 602.4 665.1]        median_ms=640.7    rows_read=1019012
+star_q2.sql   runs_ms=[7473.9 7425.8]            median_ms=7425.8   rows_read=20224430
+star_q2_agg.sql runs_ms=[0.445 0.395 0.422]      median_ms=0.422    rows_read=49
+star_q3.sql   runs_ms=[59.0 59.3 60.0]           median_ms=59.3     rows_read=300101
+star_q4.sql   runs_ms=[620.8 664.3 611.4]        median_ms=620.8    rows_read=1961127
+
+# Load times: full ETL 176 s, incremental ETL ~1 s (late-claim test; ~20 s when the
+# optional pair aggregate is rebuilt in the same run).
